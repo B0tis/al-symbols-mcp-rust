@@ -25,24 +25,39 @@ This is a Rust reimplementation of [StefanMaron/AL-Dependency-MCP-Server](https:
 
 ## Installation
 
-### From source
+### Pre-built binaries (easiest)
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/B0tis/al-symbols-mcp-rust/releases):
+
+| Platform | File |
+|----------|------|
+| Windows x64 | `al-symbols-mcp-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `al-symbols-mcp-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `al-symbols-mcp-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `al-symbols-mcp-x86_64-apple-darwin.tar.gz` |
+
+Extract the binary and place it somewhere on your `PATH` (e.g. `C:\Tools\` on Windows, `/usr/local/bin/` on Linux/macOS).
+
+### From source (requires Rust)
 
 ```bash
-cargo install --path .
+cargo install --git https://github.com/B0tis/al-symbols-mcp-rust
 ```
 
-### Build from release
+> **Windows note:** If you see `linker 'link.exe' not found`, either install
+> [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+> with the **"Desktop development with C++"** workload, or use the GNU toolchain instead:
+>
+> ```
+> rustup target add x86_64-pc-windows-gnu
+> cargo install --git https://github.com/B0tis/al-symbols-mcp-rust --target x86_64-pc-windows-gnu
+> ```
 
-```bash
-cargo build --release
-# Binary at: target/release/al-symbols-mcp
-```
+## Usage with Cursor / Windsurf / Claude Desktop
 
-## Usage
+### Cursor
 
-### MCP Configuration
-
-Add to your MCP client configuration (e.g., Claude Desktop, Cursor):
+Create `.cursor/mcp.json` in your project root (or open **Settings > MCP > Add new MCP server**):
 
 ```json
 {
@@ -55,7 +70,50 @@ Add to your MCP client configuration (e.g., Claude Desktop, Cursor):
 }
 ```
 
-The server communicates over **stdio** using the MCP JSON-RPC protocol.
+If the binary is not on your PATH, use the full path:
+
+```json
+{
+  "mcpServers": {
+    "al-symbols": {
+      "command": "C:\\Tools\\al-symbols-mcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+### Windsurf
+
+Edit `~/.codeium/windsurf/mcp_config.json` (or open **Settings > search MCP > Edit in mcp_config.json**):
+
+```json
+{
+  "mcpServers": {
+    "al-symbols": {
+      "command": "al-symbols-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Edit `claude_desktop_config.json` (see [MCP docs](https://modelcontextprotocol.io/quickstart/user)):
+
+```json
+{
+  "mcpServers": {
+    "al-symbols": {
+      "command": "al-symbols-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+The server communicates over **stdio** which all MCP clients support natively. Open your AL project folder before using the tools so the server can auto-discover `.alpackages` and `app.json`.
 
 ### Environment
 
