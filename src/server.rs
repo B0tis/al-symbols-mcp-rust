@@ -167,7 +167,7 @@ struct GetFreeIdParams {
     /// How many free IDs to return per type (default: 1)
     #[serde(default = "default_count")]
     count: usize,
-    /// Explicit path to app.json. If omitted the tool auto-discovers it from the workspace root.
+    /// Path to app.json. Auto-detected from the workspace root — only needed if auto-detection fails.
     #[serde(default)]
     app_json_path: Option<String>,
 }
@@ -483,7 +483,7 @@ impl AlMcpServer {
 
     #[tool(
         name = "al_get_free_id",
-        description = "Get the next free object ID(s) for your AL app. Reads idRanges from app.json and scans local .al source files (excluding .alpackages) to find unused IDs. When no object_type is specified, returns the next free ID for EVERY object type so the agent can pick the right one directly."
+        description = "Get the next free object ID(s) for your AL app. Automatically finds app.json in the workspace root, reads idRanges, and scans local .al source files to find unused IDs. When no object_type is given, returns the next free ID for EVERY object type. No parameters required for typical use."
     )]
     fn get_free_id(
         &self,
@@ -669,11 +669,31 @@ fn find_app_json() -> Result<PathBuf, McpError> {
         McpError::internal_error(format!("Cannot determine working directory: {}", e), None)
     })?;
 
-    // Walk up to 3 levels deep looking for app.json
+    // 1. Check root directory first (most common location)
+    let root_app_json = cwd.join("app.json");
+    if root_app_json.is_file() {
+        return Ok(root_app_json);
+    }
+
+    // 2. Walk up to 3 levels deep, but skip .alpackages / .snapshots / node_modules
+    let exclude: std::collections::HashSet<&str> =
+        [".alpackages", ".snapshots", "node_modules", ".git", "target"]
+            .iter()
+            .copied()
+            .collect();
+
     for entry in walkdir::WalkDir::new(&cwd)
         .max_depth(3)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|e| {
+            if e.file_type().is_dir() {
+                let name = e.file_name().to_string_lossy();
+                !exclude.contains(name.as_ref())
+            } else {
+                true
+            }
+        })
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() && entry.file_name().eq_ignore_ascii_case("app.json") {
