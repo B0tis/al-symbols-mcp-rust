@@ -24,6 +24,7 @@ pub struct PackageManager {
     database: SymbolDatabase,
     loaded_packages: parking_lot::Mutex<Vec<ALPackageInfo>>,
     loaded_dirs: parking_lot::Mutex<HashSet<String>>,
+    load_errors: parking_lot::Mutex<Vec<String>>,
 }
 
 impl PackageManager {
@@ -32,6 +33,7 @@ impl PackageManager {
             database,
             loaded_packages: parking_lot::Mutex::new(Vec::new()),
             loaded_dirs: parking_lot::Mutex::new(HashSet::new()),
+            load_errors: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -41,6 +43,10 @@ impl PackageManager {
 
     pub fn loaded_packages(&self) -> Vec<ALPackageInfo> {
         self.loaded_packages.lock().clone()
+    }
+
+    pub fn load_errors(&self) -> Vec<String> {
+        self.load_errors.lock().clone()
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -101,6 +107,8 @@ impl PackageManager {
                 loaded.insert(dir.clone());
             }
         }
+
+        self.load_errors.lock().extend(errors.clone());
 
         Ok(LoadResult {
             packages_loaded,

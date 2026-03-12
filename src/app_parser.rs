@@ -15,45 +15,19 @@ pub enum AppParseError {
 }
 
 const NAVX_HEADER_SIZE: usize = 40;
-const ZIP_EOCD_SIGNATURE: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
 const ZIP_LOCAL_SIGNATURE: [u8; 2] = [0x50, 0x4B];
 
 fn find_zip_start(buffer: &[u8]) -> Option<usize> {
     let search_end = buffer.len().min(200);
     for i in NAVX_HEADER_SIZE..search_end {
-        if i + 1 < buffer.len() && buffer[i] == ZIP_LOCAL_SIGNATURE[0] && buffer[i + 1] == ZIP_LOCAL_SIGNATURE[1] {
+        if i + 1 < buffer.len()
+            && buffer[i] == ZIP_LOCAL_SIGNATURE[0]
+            && buffer[i + 1] == ZIP_LOCAL_SIGNATURE[1]
+        {
             return Some(i);
         }
     }
     None
-}
-
-fn find_zip_end(buffer: &[u8]) -> Option<usize> {
-    if buffer.len() < 22 {
-        return None;
-    }
-    let search_start = if buffer.len() > 65557 {
-        buffer.len() - 65557
-    } else {
-        0
-    };
-    for i in (search_start..buffer.len() - 3).rev() {
-        if buffer[i..i + 4] == ZIP_EOCD_SIGNATURE {
-            let comment_len = if i + 20 < buffer.len() {
-                u16::from_le_bytes([buffer[i + 20], buffer[i + 21]]) as usize
-            } else {
-                0
-            };
-            return Some(i + 22 + comment_len);
-        }
-    }
-    None
-}
-
-fn extract_zip_portion(buffer: &[u8]) -> Result<Vec<u8>, AppParseError> {
-    let zip_start = find_zip_start(buffer).ok_or(AppParseError::NoZipSignature)?;
-    let zip_end = find_zip_end(buffer).unwrap_or(buffer.len());
-    Ok(buffer[zip_start..zip_end].to_vec())
 }
 
 fn strip_bom_and_nulls(data: &[u8]) -> Vec<u8> {
@@ -69,12 +43,10 @@ fn strip_bom_and_nulls(data: &[u8]) -> Vec<u8> {
     data[start..end].to_vec()
 }
 
-pub fn extract_entry_from_app(app_path: &Path, entry_name: &str) -> Result<Vec<u8>, AppParseError> {
-    let buffer = std::fs::read(app_path)?;
-    let zip_data = extract_zip_portion(&buffer)?;
-    let cursor = Cursor::new(zip_data);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-
+fn find_entry_in_archive(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    entry_name: &str,
+) -> Result<Vec<u8>, AppParseError> {
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         if file.name().eq_ignore_ascii_case(entry_name) {
@@ -83,8 +55,45 @@ pub fn extract_entry_from_app(app_path: &Path, entry_name: &str) -> Result<Vec<u
             return Ok(strip_bom_and_nulls(&contents));
         }
     }
-
     Err(AppParseError::EntryNotFound(entry_name.to_string()))
+}
+
+pub fn extract_entry_from_app(app_path: &Path, entry_name: &str) -> Result<Vec<u8>, AppParseError> {
+    let buffer = std::fs::read(app_path)?;
+
+    // Strategy 1: Extract ZIP portion from after the NAVX header and let
+    // the zip crate find the EOCD itself. This handles both signed and
+    // unsigned packages correctly.
+    if let Some(zip_start) = find_zip_start(&buffer) {
+        let zip_slice = &buffer[zip_start..];
+        if let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(zip_slice)) {
+            match find_entry_in_archive(&mut archive, entry_name) {
+                Ok(data) => return Ok(data),
+                Err(AppParseError::EntryNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    // Strategy 2: Try the full buffer directly. Some .app files may have
+    // ZIP offsets that include the NAVX header.
+    if let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(buffer.as_slice())) {
+        match find_entry_in_archive(&mut archive, entry_name) {
+            Ok(data) => return Ok(data),
+            Err(AppParseError::EntryNotFound(name)) => {
+                return Err(AppParseError::EntryNotFound(name))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if find_zip_start(&buffer).is_none() {
+        return Err(AppParseError::NoZipSignature);
+    }
+
+    Err(AppParseError::Zip(zip::result::ZipError::InvalidArchive(
+        "Could not open ZIP archive in .app file with any strategy",
+    )))
 }
 
 pub fn extract_symbol_reference(app_path: &Path) -> Result<Vec<u8>, AppParseError> {
