@@ -5,7 +5,7 @@ use crate::types::ALPackageInfo;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 #[derive(Error, Debug)]
@@ -67,7 +67,7 @@ impl PackageManager {
 
         let unique_apps = filter_latest_versions(&all_app_files);
 
-        info!(
+        debug!(
             "Found {} unique packages (from {} total .app files) in {} directories",
             unique_apps.len(),
             all_app_files.len(),
@@ -83,7 +83,7 @@ impl PackageManager {
         for app_path in &sorted {
             match self.load_single_package(app_path) {
                 Ok((pkg, count)) => {
-                    info!("Loaded {} ({} objects)", pkg.name, count);
+                    debug!("Loaded {} ({} objects)", pkg.name, count);
                     packages_loaded += 1;
                     objects_loaded += count;
                 }
@@ -122,7 +122,7 @@ impl PackageManager {
         for app_path in &sorted {
             match self.load_single_package(app_path) {
                 Ok((pkg, count)) => {
-                    info!("Loaded {} ({} objects)", pkg.name, count);
+                    debug!("Loaded {} ({} objects)", pkg.name, count);
                     packages_loaded += 1;
                     objects_loaded += count;
                 }

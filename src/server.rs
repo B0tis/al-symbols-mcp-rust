@@ -32,16 +32,22 @@ impl AlMcpServer {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".into());
-            info!("Auto-discovering packages from {}", cwd);
+            eprintln!("Auto-discovering packages from {}...", cwd);
+            let start = std::time::Instant::now();
             match self.package_manager.auto_discover_and_load(&cwd) {
                 Ok(result) => {
-                    info!(
-                        "Auto-loaded {} packages with {} objects",
-                        result.packages_loaded, result.objects_loaded
+                    eprintln!(
+                        "Loaded {} packages ({} objects) in {:.1}s",
+                        result.packages_loaded,
+                        result.objects_loaded,
+                        start.elapsed().as_secs_f64()
                     );
+                    for err in &result.errors {
+                        eprintln!("  Warning: {}", err);
+                    }
                 }
                 Err(e) => {
-                    tracing::error!("Auto-discovery failed: {}", e);
+                    eprintln!("Auto-discovery failed: {}", e);
                 }
             }
         }
