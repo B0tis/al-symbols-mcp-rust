@@ -1,3 +1,4 @@
+mod al_scanner;
 mod app_parser;
 mod database;
 mod manifest;

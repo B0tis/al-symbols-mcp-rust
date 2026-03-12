@@ -1,3 +1,4 @@
+use crate::al_scanner;
 use crate::database::SymbolDatabase;
 use crate::package_manager::PackageManager;
 use crate::types::*;
@@ -443,18 +444,20 @@ impl AlMcpServer {
 
     #[tool(
         name = "al_get_free_id",
-        description = "Get the next free object ID(s) for your AL app. Reads idRanges from app.json and checks all loaded packages plus your workspace objects to find unused IDs within the allowed ranges."
+        description = "Get the next free object ID(s) for your AL app. Reads idRanges from app.json and scans local .al source files (excluding .alpackages) to find unused IDs within the allowed ranges."
     )]
     fn get_free_id(
         &self,
         #[tool(aggr)] params: GetFreeIdParams,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_loaded();
-
         let app_json_path = match params.app_json_path {
             Some(ref p) => PathBuf::from(p),
             None => find_app_json()?,
         };
+
+        let app_dir = app_json_path
+            .parent()
+            .ok_or_else(|| McpError::internal_error("Cannot determine app directory from app.json path", None))?;
 
         let ranges = parse_id_ranges(&app_json_path)?;
 
@@ -465,11 +468,10 @@ impl AlMcpServer {
             })));
         }
 
-        let used: BTreeSet<i64> = self
-            .db()
-            .used_ids(params.object_type.as_deref())
-            .into_iter()
-            .collect();
+        let source_objects =
+            al_scanner::scan_al_sources(app_dir, params.object_type.as_deref());
+
+        let used: BTreeSet<i64> = source_objects.iter().map(|o| o.id).collect();
 
         let count = params.count.max(1).min(100);
         let mut free_ids: Vec<i64> = Vec::with_capacity(count);
@@ -491,6 +493,19 @@ impl AlMcpServer {
             .filter(|&&id| ranges.iter().any(|r| id >= r.from && id <= r.to))
             .count();
 
+        let used_objects: Vec<serde_json::Value> = source_objects
+            .iter()
+            .filter(|o| ranges.iter().any(|r| o.id >= r.from && o.id <= r.to))
+            .map(|o| {
+                serde_json::json!({
+                    "type": o.object_type,
+                    "id": o.id,
+                    "name": o.name,
+                    "file": o.file,
+                })
+            })
+            .collect();
+
         Ok(Self::json_result(&serde_json::json!({
             "freeIds": free_ids,
             "objectType": params.object_type,
@@ -498,6 +513,8 @@ impl AlMcpServer {
             "totalCapacity": total_capacity,
             "usedInRanges": used_in_ranges,
             "availableInRanges": total_capacity as usize - used_in_ranges,
+            "usedObjects": used_objects,
+            "appDir": app_dir.to_string_lossy(),
             "appJsonPath": app_json_path.to_string_lossy(),
         })))
     }

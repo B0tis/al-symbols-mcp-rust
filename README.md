@@ -122,7 +122,7 @@ Token-efficient categorized overview with intelligent procedure grouping.
 
 ### `al_get_free_id`
 
-Get the next free object ID(s) for your AL app. Reads `idRanges` from `app.json` and checks all loaded packages to find unused IDs within the allowed ranges.
+Get the next free object ID(s) for your AL app. Reads `idRanges` from `app.json` and scans **only your app's own `.al` source files** (excluding `.alpackages/`, `.snapshots/`) to find unused IDs within the allowed ranges.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -134,14 +134,20 @@ Get the next free object ID(s) for your AL app. Reads `idRanges` from `app.json`
 
 ```json
 {
-  "freeIds": [70000, 70001, 70002],
+  "freeIds": [70003, 70004, 75000],
+  "objectType": "table",
   "idRanges": [
     { "from": 70000, "to": 74999 },
     { "from": 75000, "to": 79999 }
   ],
   "totalCapacity": 10000,
-  "usedInRanges": 42,
-  "availableInRanges": 9958
+  "usedInRanges": 3,
+  "availableInRanges": 9997,
+  "usedObjects": [
+    { "type": "table", "id": 70000, "name": "My Table", "file": "src/MyTable.al" },
+    { "type": "table", "id": 70001, "name": "My Table 2", "file": "src/MyTable2.al" },
+    { "type": "table", "id": 70002, "name": "My Table 3", "file": "src/MyTable3.al" }
+  ]
 }
 ```
 
