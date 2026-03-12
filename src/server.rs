@@ -7,6 +7,8 @@ use rmcp::{Error as McpError, ServerHandler, tool};
 use rmcp::model::Implementation;
 use serde::Deserialize;
 use schemars::JsonSchema;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
@@ -137,6 +139,23 @@ struct PackagesParams {
     /// Directory path (required for "load" action)
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetFreeIdParams {
+    /// Filter by object type (Table, Page, Codeunit, Report, Enum, etc.). When set, only IDs used by that type are considered occupied.
+    #[serde(default)]
+    object_type: Option<String>,
+    /// How many free IDs to return (default: 1)
+    #[serde(default = "default_count")]
+    count: usize,
+    /// Explicit path to app.json. If omitted the tool auto-discovers it from the workspace root.
+    #[serde(default)]
+    app_json_path: Option<String>,
+}
+
+fn default_count() -> usize {
+    1
 }
 
 fn default_limit() -> usize {
@@ -423,6 +442,67 @@ impl AlMcpServer {
     }
 
     #[tool(
+        name = "al_get_free_id",
+        description = "Get the next free object ID(s) for your AL app. Reads idRanges from app.json and checks all loaded packages plus your workspace objects to find unused IDs within the allowed ranges."
+    )]
+    fn get_free_id(
+        &self,
+        #[tool(aggr)] params: GetFreeIdParams,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_loaded();
+
+        let app_json_path = match params.app_json_path {
+            Some(ref p) => PathBuf::from(p),
+            None => find_app_json()?,
+        };
+
+        let ranges = parse_id_ranges(&app_json_path)?;
+
+        if ranges.is_empty() {
+            return Ok(Self::json_result(&serde_json::json!({
+                "error": "No idRanges found in app.json",
+                "appJsonPath": app_json_path.to_string_lossy(),
+            })));
+        }
+
+        let used: BTreeSet<i64> = self
+            .db()
+            .used_ids(params.object_type.as_deref())
+            .into_iter()
+            .collect();
+
+        let count = params.count.max(1).min(100);
+        let mut free_ids: Vec<i64> = Vec::with_capacity(count);
+
+        'outer: for range in &ranges {
+            for id in range.from..=range.to {
+                if !used.contains(&id) {
+                    free_ids.push(id);
+                    if free_ids.len() >= count {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        let total_capacity: i64 = ranges.iter().map(|r| r.to - r.from + 1).sum();
+        let used_in_ranges: usize = used
+            .iter()
+            .filter(|&&id| ranges.iter().any(|r| id >= r.from && id <= r.to))
+            .count();
+
+        Ok(Self::json_result(&serde_json::json!({
+            "freeIds": free_ids,
+            "objectType": params.object_type,
+            "idRanges": ranges.iter().map(|r| serde_json::json!({ "from": r.from, "to": r.to })).collect::<Vec<_>>(),
+            "totalCapacity": total_capacity,
+            "usedInRanges": used_in_ranges,
+            "availableInRanges": total_capacity as usize - used_in_ranges,
+            "appJsonPath": app_json_path.to_string_lossy(),
+        })))
+    }
+
+    #[tool(
         name = "al_packages",
         description = "Package management: load packages from a directory, list loaded packages, or get package statistics. Actions: 'load', 'list', 'stats'."
     )]
@@ -498,6 +578,78 @@ impl ServerHandler for AlMcpServer {
             ..Default::default()
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct IdRange {
+    from: i64,
+    to: i64,
+}
+
+fn find_app_json() -> Result<PathBuf, McpError> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        McpError::internal_error(format!("Cannot determine working directory: {}", e), None)
+    })?;
+
+    // Walk up to 3 levels deep looking for app.json
+    for entry in walkdir::WalkDir::new(&cwd)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name().eq_ignore_ascii_case("app.json") {
+            return Ok(entry.into_path());
+        }
+    }
+
+    Err(McpError::internal_error(
+        format!(
+            "No app.json found under {}. Provide the path explicitly via the app_json_path parameter.",
+            cwd.display()
+        ),
+        None,
+    ))
+}
+
+fn parse_id_ranges(app_json_path: &Path) -> Result<Vec<IdRange>, McpError> {
+    let content = std::fs::read_to_string(app_json_path).map_err(|e| {
+        McpError::internal_error(
+            format!("Cannot read {}: {}", app_json_path.display(), e),
+            None,
+        )
+    })?;
+
+    let val: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        McpError::internal_error(
+            format!("Invalid JSON in {}: {}", app_json_path.display(), e),
+            None,
+        )
+    })?;
+
+    let ranges_val = val.get("idRanges").or_else(|| val.get("idRange"));
+
+    let ranges = match ranges_val {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|r| {
+                let from = r.get("from").and_then(|v| v.as_i64())?;
+                let to = r.get("to").and_then(|v| v.as_i64())?;
+                Some(IdRange { from, to })
+            })
+            .collect(),
+        Some(serde_json::Value::Object(obj)) => {
+            let from = obj.get("from").and_then(|v| v.as_i64());
+            let to = obj.get("to").and_then(|v| v.as_i64());
+            match (from, to) {
+                (Some(f), Some(t)) => vec![IdRange { from: f, to: t }],
+                _ => vec![],
+            }
+        }
+        _ => vec![],
+    };
+
+    Ok(ranges)
 }
 
 fn categorize_procedure(name: &str, properties: &[ALProperty]) -> String {

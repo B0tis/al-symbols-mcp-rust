@@ -11,7 +11,8 @@ This is a Rust reimplementation of [StefanMaron/AL-Dependency-MCP-Server](https:
 - **Full symbol parsing** of `SymbolReference.json` with namespace support
 - **Dependency resolution** with topological sorting and circular dependency detection
 - **In-memory indexed database** with O(1) lookups by name, type, and ID
-- **6 MCP tools** for comprehensive AL object analysis
+- **7 MCP tools** for comprehensive AL object analysis
+- **Free ID lookup** from `app.json` `idRanges` with per-type filtering
 
 ## Performance
 
@@ -119,6 +120,31 @@ Token-efficient categorized overview with intelligent procedure grouping.
 | `object_type` | string | Object type |
 | `name` | string | Object name |
 
+### `al_get_free_id`
+
+Get the next free object ID(s) for your AL app. Reads `idRanges` from `app.json` and checks all loaded packages to find unused IDs within the allowed ranges.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `object_type` | string? | Only consider IDs used by this type as occupied |
+| `count` | number | How many free IDs to return (default: 1, max: 100) |
+| `app_json_path` | string? | Explicit path to `app.json` (auto-discovered if omitted) |
+
+**Example response:**
+
+```json
+{
+  "freeIds": [70000, 70001, 70002],
+  "idRanges": [
+    { "from": 70000, "to": 74999 },
+    { "from": 75000, "to": 79999 }
+  ],
+  "totalCapacity": 10000,
+  "usedInRanges": 42,
+  "availableInRanges": 9958
+}
+```
+
 ### `al_packages`
 
 Package management operations.
@@ -134,7 +160,7 @@ Package management operations.
 2. **Extraction**: Reads `.app` files (ZIP archives with a 40-byte NAVX header), extracts `NavxManifest.xml` and `SymbolReference.json`
 3. **Parsing**: Processes symbol JSON supporting both modern namespaced and legacy flat formats
 4. **Indexing**: Builds an in-memory database with multiple indices for fast lookups
-5. **Serving**: Exposes indexed data through 6 MCP tools over stdio
+5. **Serving**: Exposes indexed data through 7 MCP tools over stdio
 
 ## Supported AL Object Types
 

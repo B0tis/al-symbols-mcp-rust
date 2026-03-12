@@ -504,6 +504,21 @@ impl SymbolDatabase {
             .collect()
     }
 
+    pub fn used_ids(&self, object_type: Option<&str>) -> Vec<i64> {
+        let db = self.inner.read();
+        let type_filter = object_type.map(|t| ALObjectType::from_str_loose(t));
+        db.all_objects
+            .iter()
+            .filter(|obj| {
+                type_filter
+                    .as_ref()
+                    .map(|tf| &obj.object_type == tf)
+                    .unwrap_or(true)
+            })
+            .map(|obj| obj.id)
+            .collect()
+    }
+
     pub fn clear(&self) {
         let mut db = self.inner.write();
         *db = Inner::default();
@@ -740,5 +755,26 @@ mod tests {
         assert_eq!(db.object_count(), 1);
         db.clear();
         assert_eq!(db.object_count(), 0);
+    }
+
+    #[test]
+    fn test_used_ids() {
+        let db = SymbolDatabase::new();
+        db.add_objects(vec![
+            make_test_object(70000, "MyTable", ALObjectType::Table),
+            make_test_object(70001, "MyPage", ALObjectType::Page),
+            make_test_object(70002, "MyCU", ALObjectType::Codeunit),
+        ]);
+
+        let all_ids = db.used_ids(None);
+        assert_eq!(all_ids.len(), 3);
+
+        let table_ids = db.used_ids(Some("Table"));
+        assert_eq!(table_ids.len(), 1);
+        assert_eq!(table_ids[0], 70000);
+
+        let page_ids = db.used_ids(Some("Page"));
+        assert_eq!(page_ids.len(), 1);
+        assert_eq!(page_ids[0], 70001);
     }
 }
