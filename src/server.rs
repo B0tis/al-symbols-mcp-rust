@@ -11,7 +11,6 @@ use schemars::JsonSchema;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
 
 #[derive(Clone)]
 pub struct AlMcpServer {
@@ -51,6 +50,18 @@ impl AlMcpServer {
                 }
             }
         }
+    }
+
+    fn load_error_hint(&self) -> Option<String> {
+        let errors = self.package_manager.load_errors();
+        if errors.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "WARNING: {} package(s) failed to load. Use al_packages with action 'list' to see details. Errors: {}",
+            errors.len(),
+            errors.join("; ")
+        ))
     }
 
     fn db(&self) -> &SymbolDatabase {
@@ -188,6 +199,8 @@ impl AlMcpServer {
             params.offset,
         );
 
+        let load_warning = self.load_error_hint();
+
         if params.summary_mode {
             let summary: Vec<serde_json::Value> = results
                 .iter()
@@ -208,6 +221,7 @@ impl AlMcpServer {
                 "returned": summary.len(),
                 "offset": params.offset,
                 "results": summary,
+                "loadWarning": load_warning,
             })))
         } else {
             Ok(Self::json_result(&serde_json::json!({
@@ -215,6 +229,7 @@ impl AlMcpServer {
                 "returned": results.len(),
                 "offset": params.offset,
                 "results": results,
+                "loadWarning": load_warning,
             })))
         }
     }
@@ -553,6 +568,7 @@ impl AlMcpServer {
             "list" => {
                 self.ensure_loaded();
                 let packages = self.package_manager.loaded_packages();
+                let errors = self.package_manager.load_errors();
                 Ok(Self::json_result(&serde_json::json!({
                     "totalPackages": packages.len(),
                     "totalObjects": self.db().object_count(),
@@ -565,6 +581,8 @@ impl AlMcpServer {
                             "dependencyCount": p.dependencies.len(),
                         })
                     }).collect::<Vec<_>>(),
+                    "failedPackages": errors.len(),
+                    "loadErrors": errors,
                 })))
             }
             "stats" => {
