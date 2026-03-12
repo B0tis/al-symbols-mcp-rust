@@ -23,7 +23,7 @@ jobs:
             os: macos-latest
             artifact: al-symbols-mcp
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             artifact: al-symbols-mcp
 
     runs-on: ${{ matrix.os }}
