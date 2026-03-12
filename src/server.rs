@@ -161,10 +161,10 @@ struct PackagesParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetFreeIdParams {
-    /// Filter by object type (Table, Page, Codeunit, Report, Enum, etc.). When set, only IDs used by that type are considered occupied.
+    /// Filter by object type (table, page, codeunit, report, enum, etc.). When omitted, returns the next free ID for every object type found in the workspace.
     #[serde(default)]
     object_type: Option<String>,
-    /// How many free IDs to return (default: 1)
+    /// How many free IDs to return per type (default: 1)
     #[serde(default = "default_count")]
     count: usize,
     /// Explicit path to app.json. If omitted the tool auto-discovers it from the workspace root.
@@ -175,6 +175,24 @@ struct GetFreeIdParams {
 fn default_count() -> usize {
     1
 }
+
+const AL_OBJECT_TYPES: &[&str] = &[
+    "table",
+    "tableextension",
+    "page",
+    "pageextension",
+    "codeunit",
+    "report",
+    "reportextension",
+    "xmlport",
+    "enum",
+    "enumextension",
+    "query",
+    "permissionset",
+    "permissionsetextension",
+    "controladdin",
+    "interface",
+];
 
 fn default_limit() -> usize {
     50
@@ -465,7 +483,7 @@ impl AlMcpServer {
 
     #[tool(
         name = "al_get_free_id",
-        description = "Get the next free object ID(s) for your AL app. Reads idRanges from app.json and scans local .al source files (excluding .alpackages) to find unused IDs within the allowed ranges."
+        description = "Get the next free object ID(s) for your AL app. Reads idRanges from app.json and scans local .al source files (excluding .alpackages) to find unused IDs. When no object_type is specified, returns the next free ID for EVERY object type so the agent can pick the right one directly."
     )]
     fn get_free_id(
         &self,
@@ -489,37 +507,58 @@ impl AlMcpServer {
             })));
         }
 
-        let source_objects =
-            al_scanner::scan_al_sources(app_dir, params.object_type.as_deref());
-
-        let used: BTreeSet<i64> = source_objects.iter().map(|o| o.id).collect();
-
         let count = params.count.max(1).min(100);
-        let mut free_ids: Vec<i64> = Vec::with_capacity(count);
 
-        'outer: for range in &ranges {
-            for id in range.from..=range.to {
-                if !used.contains(&id) {
-                    free_ids.push(id);
-                    if free_ids.len() >= count {
-                        break 'outer;
+        let types_to_query: Vec<&str> = match params.object_type {
+            Some(ref t) => vec![leak_str(t)],
+            None => AL_OBJECT_TYPES.to_vec(),
+        };
+
+        // Scan all source objects once (no type filter) for the full picture
+        let all_source_objects = al_scanner::scan_al_sources(app_dir, None);
+
+        let mut per_type: Vec<serde_json::Value> = Vec::new();
+
+        for obj_type in &types_to_query {
+            let used: BTreeSet<i64> = all_source_objects
+                .iter()
+                .filter(|o| o.object_type == *obj_type)
+                .map(|o| o.id)
+                .collect();
+
+            let mut free_ids: Vec<i64> = Vec::with_capacity(count);
+            'outer: for range in &ranges {
+                for id in range.from..=range.to {
+                    if !used.contains(&id) {
+                        free_ids.push(id);
+                        if free_ids.len() >= count {
+                            break 'outer;
+                        }
                     }
                 }
             }
+
+            let used_in_ranges: usize = used
+                .iter()
+                .filter(|&&id| ranges.iter().any(|r| id >= r.from && id <= r.to))
+                .count();
+
+            per_type.push(serde_json::json!({
+                "objectType": obj_type,
+                "nextFreeId": free_ids.first(),
+                "freeIds": free_ids,
+                "usedCount": used_in_ranges,
+            }));
         }
 
         let total_capacity: i64 = ranges.iter().map(|r| r.to - r.from + 1).sum();
-        let used_in_ranges: usize = used
-            .iter()
-            .filter(|&&id| ranges.iter().any(|r| id >= r.from && id <= r.to))
-            .count();
 
-        let used_objects: Vec<serde_json::Value> = source_objects
+        let used_objects: Vec<serde_json::Value> = all_source_objects
             .iter()
             .filter(|o| ranges.iter().any(|r| o.id >= r.from && o.id <= r.to))
             .map(|o| {
                 serde_json::json!({
-                    "type": o.object_type,
+                    "objectType": o.object_type,
                     "id": o.id,
                     "name": o.name,
                     "file": o.file,
@@ -528,12 +567,10 @@ impl AlMcpServer {
             .collect();
 
         Ok(Self::json_result(&serde_json::json!({
-            "freeIds": free_ids,
-            "objectType": params.object_type,
+            "perObjectType": per_type,
             "idRanges": ranges.iter().map(|r| serde_json::json!({ "from": r.from, "to": r.to })).collect::<Vec<_>>(),
             "totalCapacity": total_capacity,
-            "usedInRanges": used_in_ranges,
-            "availableInRanges": total_capacity as usize - used_in_ranges,
+            "totalUsed": used_objects.len(),
             "usedObjects": used_objects,
             "appDir": app_dir.to_string_lossy(),
             "appJsonPath": app_json_path.to_string_lossy(),
@@ -691,6 +728,11 @@ fn parse_id_ranges(app_json_path: &Path) -> Result<Vec<IdRange>, McpError> {
     };
 
     Ok(ranges)
+}
+
+fn leak_str(s: &str) -> &'static str {
+    let normalized = crate::al_scanner::normalize_type(s);
+    Box::leak(normalized.into_boxed_str())
 }
 
 fn categorize_procedure(name: &str, properties: &[ALProperty]) -> String {
