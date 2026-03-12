@@ -180,31 +180,32 @@ Token-efficient categorized overview with intelligent procedure grouping.
 
 ### `al_get_free_id`
 
-Get the next free object ID(s) for your AL app. Reads `idRanges` from `app.json` and scans **only your app's own `.al` source files** (excluding `.alpackages/`, `.snapshots/`) to find unused IDs within the allowed ranges.
+Get the next free object ID(s) for your AL app. Reads `idRanges` from `app.json` and scans **only your app's own `.al` source files** (excluding `.alpackages/`, `.snapshots/`). When no `object_type` is specified, returns the next free ID **for every object type** so the agent knows exactly which ID to use.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `object_type` | string? | Only consider IDs used by this type as occupied |
-| `count` | number | How many free IDs to return (default: 1, max: 100) |
+| `object_type` | string? | Filter to a single type (table, page, codeunit, etc.) |
+| `count` | number | How many free IDs to return per type (default: 1, max: 100) |
 | `app_json_path` | string? | Explicit path to `app.json` (auto-discovered if omitted) |
 
-**Example response:**
+**Example response** (no type filter -- shows all types):
 
 ```json
 {
-  "freeIds": [70003, 70004, 75000],
-  "objectType": "table",
-  "idRanges": [
-    { "from": 70000, "to": 74999 },
-    { "from": 75000, "to": 79999 }
+  "perObjectType": [
+    { "objectType": "table",          "nextFreeId": 70002, "freeIds": [70002], "usedCount": 2 },
+    { "objectType": "tableextension", "nextFreeId": 70000, "freeIds": [70000], "usedCount": 0 },
+    { "objectType": "page",           "nextFreeId": 70001, "freeIds": [70001], "usedCount": 1 },
+    { "objectType": "pageextension",  "nextFreeId": 70000, "freeIds": [70000], "usedCount": 0 },
+    { "objectType": "codeunit",       "nextFreeId": 70002, "freeIds": [70002], "usedCount": 2 },
+    { "objectType": "enum",           "nextFreeId": 70001, "freeIds": [70001], "usedCount": 1 }
   ],
-  "totalCapacity": 10000,
-  "usedInRanges": 3,
-  "availableInRanges": 9997,
+  "idRanges": [ { "from": 70000, "to": 74999 } ],
+  "totalCapacity": 5000,
+  "totalUsed": 6,
   "usedObjects": [
-    { "type": "table", "id": 70000, "name": "My Table", "file": "src/MyTable.al" },
-    { "type": "table", "id": 70001, "name": "My Table 2", "file": "src/MyTable2.al" },
-    { "type": "table", "id": 70002, "name": "My Table 3", "file": "src/MyTable3.al" }
+    { "objectType": "table", "id": 70000, "name": "My Table", "file": "src/MyTable.al" },
+    { "objectType": "table", "id": 70001, "name": "My Table 2", "file": "src/MyTable2.al" }
   ]
 }
 ```

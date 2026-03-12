@@ -96,6 +96,10 @@ pub fn scan_al_sources(
     objects
 }
 
+pub fn normalize_type(raw: &str) -> String {
+    normalize_object_type(raw)
+}
+
 fn normalize_object_type(raw: &str) -> String {
     match raw.to_lowercase().as_str() {
         "table" => "table",
