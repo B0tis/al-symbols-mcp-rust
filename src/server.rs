@@ -32,6 +32,14 @@ impl AlMcpServer {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".into());
             eprintln!("Auto-discovering packages from {}...", cwd);
+
+            let cli_status = self.package_manager.al_cli_status();
+            if cli_status.available {
+                eprintln!("AL CLI: {} ({})", cli_status.path, cli_status.version.as_deref().unwrap_or("unknown"));
+            } else {
+                eprintln!("AL CLI: not found — runtime packages will be skipped. Use al_cli_status tool to install.");
+            }
+
             let start = std::time::Instant::now();
             match self.package_manager.auto_discover_and_load(&cwd) {
                 Ok(result) => {
@@ -57,9 +65,17 @@ impl AlMcpServer {
         if errors.is_empty() {
             return None;
         }
+        let cli_status = self.package_manager.al_cli_status();
+        let cli_hint = if !cli_status.available {
+            " Some packages may be runtime-only and require the AL CLI to extract symbols. \
+             Use al_cli_status with action 'install' to set up AL CLI, then reload with al_packages action 'load'."
+        } else {
+            ""
+        };
         Some(format!(
-            "WARNING: {} package(s) failed to load. Use al_packages with action 'list' to see details. Errors: {}",
+            "WARNING: {} package(s) failed to load. Use al_packages with action 'list' to see details.{} Errors: {}",
             errors.len(),
+            cli_hint,
             errors.join("; ")
         ))
     }
@@ -170,6 +186,17 @@ struct GetFreeIdParams {
     /// Path to app.json. Auto-detected from the workspace root — only needed if auto-detection fails.
     #[serde(default)]
     app_json_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AlCliStatusParams {
+    /// Action: "status" to check AL CLI availability, "install" to attempt auto-installation
+    #[serde(default = "default_cli_action")]
+    action: String,
+}
+
+fn default_cli_action() -> String {
+    "status".into()
 }
 
 fn default_count() -> usize {
@@ -575,6 +602,54 @@ impl AlMcpServer {
             "appDir": app_dir.to_string_lossy(),
             "appJsonPath": app_json_path.to_string_lossy(),
         })))
+    }
+
+    #[tool(
+        name = "al_cli_status",
+        description = "Check AL CLI availability or attempt auto-installation. The AL CLI (from Microsoft.Dynamics.BusinessCentral.Development.Tools) is needed to load runtime packages that don't contain SymbolReference.json — this includes the Base Application which contains core tables like 'Sales Header', 'Sales Line', 'Purchase Header', etc. Actions: 'status' (check availability) or 'install' (auto-install via dotnet)."
+    )]
+    fn al_cli_status(
+        &self,
+        #[tool(aggr)] params: AlCliStatusParams,
+    ) -> Result<CallToolResult, McpError> {
+        match params.action.as_str() {
+            "status" => {
+                let status = self.package_manager.al_cli_status();
+                Ok(Self::json_result(&serde_json::json!({
+                    "available": status.available,
+                    "path": status.path,
+                    "version": status.version,
+                    "message": status.message,
+                    "installInstructions": if status.available { None } else {
+                        Some(crate::al_cli::AlCli::install_instructions())
+                    },
+                })))
+            }
+            "install" => {
+                match self.package_manager.try_install_al_cli() {
+                    Ok(msg) => {
+                        let status = self.package_manager.al_cli_status();
+                        Ok(Self::json_result(&serde_json::json!({
+                            "success": true,
+                            "message": msg,
+                            "available": status.available,
+                            "version": status.version,
+                            "hint": "Run al_packages with action 'load' to reload packages with AL CLI support.",
+                        })))
+                    }
+                    Err(e) => {
+                        Ok(Self::json_result(&serde_json::json!({
+                            "success": false,
+                            "error": format!("{}", e),
+                            "installInstructions": crate::al_cli::AlCli::install_instructions(),
+                        })))
+                    }
+                }
+            }
+            other => Ok(Self::json_result(&serde_json::json!({
+                "error": format!("Unknown action: {}. Use 'status' or 'install'.", other),
+            }))),
+        }
     }
 
     #[tool(

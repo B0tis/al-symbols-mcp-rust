@@ -1,11 +1,13 @@
+use crate::al_cli::AlCli;
 use crate::database::SymbolDatabase;
 use crate::manifest::parse_manifest_from_app;
-use crate::symbol_parser::parse_symbols_from_app;
+use crate::symbol_parser::{parse_symbols_from_app, parse_symbols_from_json};
 use crate::types::ALPackageInfo;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 #[derive(Error, Debug)]
@@ -18,23 +20,49 @@ pub enum PackageError {
     SymbolParse(#[from] crate::symbol_parser::SymbolParseError),
     #[error("Circular dependency detected involving: {0}")]
     CircularDependency(String),
+    #[error("AL CLI error: {0}")]
+    AlCli(#[from] crate::al_cli::AlCliError),
 }
 
 pub struct PackageManager {
     database: SymbolDatabase,
+    al_cli: Arc<parking_lot::Mutex<Option<AlCli>>>,
     loaded_packages: parking_lot::Mutex<Vec<ALPackageInfo>>,
     loaded_dirs: parking_lot::Mutex<HashSet<String>>,
     load_errors: parking_lot::Mutex<Vec<String>>,
+    al_cli_warned: parking_lot::Mutex<bool>,
 }
 
 impl PackageManager {
     pub fn new(database: SymbolDatabase) -> Self {
+        let al_cli = AlCli::new().resolve();
+        let available = al_cli.is_available();
         Self {
             database,
+            al_cli: Arc::new(parking_lot::Mutex::new(if available {
+                Some(al_cli)
+            } else {
+                None
+            })),
             loaded_packages: parking_lot::Mutex::new(Vec::new()),
             loaded_dirs: parking_lot::Mutex::new(HashSet::new()),
             load_errors: parking_lot::Mutex::new(Vec::new()),
+            al_cli_warned: parking_lot::Mutex::new(false),
         }
+    }
+
+    pub fn al_cli_status(&self) -> crate::al_cli::AlCliStatus {
+        let cli = AlCli::new().resolve();
+        cli.check_availability()
+    }
+
+    pub fn try_install_al_cli(&self) -> Result<String, crate::al_cli::AlCliError> {
+        let result = AlCli::try_auto_install()?;
+        let cli = AlCli::new().resolve();
+        if cli.is_available() {
+            *self.al_cli.lock() = Some(cli);
+        }
+        Ok(result)
     }
 
     pub fn database(&self) -> &SymbolDatabase {
@@ -155,11 +183,80 @@ impl PackageManager {
     fn load_single_package(&self, app_path: &Path) -> Result<(ALPackageInfo, usize), PackageError> {
         let manifest = parse_manifest_from_app(app_path)?;
         let package_name = format!("{} v{}", manifest.name, manifest.version);
-        let objects = parse_symbols_from_app(app_path, &package_name)?;
-        let count = objects.len();
-        self.database.add_objects(objects);
-        self.loaded_packages.lock().push(manifest.clone());
-        Ok((manifest, count))
+
+        match parse_symbols_from_app(app_path, &package_name) {
+            Ok(objects) => {
+                let count = objects.len();
+                self.database.add_objects(objects);
+                self.loaded_packages.lock().push(manifest.clone());
+                Ok((manifest, count))
+            }
+            Err(zip_err) => {
+                debug!(
+                    "Direct symbol extraction failed for {}: {}. Trying AL CLI fallback...",
+                    app_path.display(),
+                    zip_err
+                );
+                self.load_via_al_cli(app_path, &manifest, &package_name)
+                    .map_err(|cli_err| {
+                        let mut warned = self.al_cli_warned.lock();
+                        if !*warned {
+                            eprintln!(
+                                "Note: Some packages lack SymbolReference.json and require AL CLI.\n{}",
+                                AlCli::install_instructions()
+                            );
+                            *warned = true;
+                        }
+                        warn!(
+                            "Both direct extraction and AL CLI failed for {}: zip={}, cli={}",
+                            app_path.display(),
+                            zip_err,
+                            cli_err
+                        );
+                        PackageError::SymbolParse(zip_err)
+                    })
+            }
+        }
+    }
+
+    fn load_via_al_cli(
+        &self,
+        app_path: &Path,
+        manifest: &ALPackageInfo,
+        package_name: &str,
+    ) -> Result<(ALPackageInfo, usize), String> {
+        let al_cli_guard = self.al_cli.lock();
+        let al_cli = al_cli_guard
+            .as_ref()
+            .ok_or_else(|| "AL CLI not available".to_string())?;
+
+        let symbol_path = al_cli
+            .create_symbol_package(app_path)
+            .map_err(|e| format!("CreateSymbolPackage failed: {}", e))?;
+
+        let result = (|| -> Result<(ALPackageInfo, usize), String> {
+            let objects = parse_symbols_from_app(&symbol_path, package_name)
+                .or_else(|_| {
+                    let data = crate::app_parser::extract_symbol_reference(&symbol_path)
+                        .map_err(|e| format!("Extract from symbol package: {}", e))?;
+                    parse_symbols_from_json(&data, package_name)
+                        .map_err(|e| format!("Parse symbol JSON: {}", e))
+                })
+                .map_err(|e| format!("Failed to parse symbol package: {}", e))?;
+
+            let count = objects.len();
+            info!(
+                "AL CLI: Loaded {} objects from {} via CreateSymbolPackage",
+                count,
+                app_path.display()
+            );
+            self.database.add_objects(objects);
+            self.loaded_packages.lock().push(manifest.clone());
+            Ok((manifest.clone(), count))
+        })();
+
+        AlCli::cleanup_symbol_file(&symbol_path);
+        result
     }
 
     fn discover_package_directories(&self, root_path: &str) -> Result<Vec<String>, PackageError> {
