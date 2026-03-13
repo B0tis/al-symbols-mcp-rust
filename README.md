@@ -8,10 +8,11 @@ This is a Rust reimplementation of [StefanMaron/AL-Dependency-MCP-Server](https:
 
 - **Auto-discovery** of `.alpackages` directories and VS Code `al.packageCachePath` settings
 - **ZIP extraction** from compiled `.app` files (handles 40-byte NAVX headers and signed packages)
+- **AL CLI integration** — automatically falls back to `AL CreateSymbolPackage` for runtime packages that lack `SymbolReference.json` (e.g. the Base Application containing Sales Header, Purchase Header, etc.)
 - **Full symbol parsing** of `SymbolReference.json` with namespace support
 - **Dependency resolution** with topological sorting and circular dependency detection
 - **In-memory indexed database** with O(1) lookups by name, type, and ID
-- **7 MCP tools** for comprehensive AL object analysis
+- **8 MCP tools** for comprehensive AL object analysis
 - **Free ID lookup** from `app.json` `idRanges` with per-type filtering
 
 ## Performance
@@ -219,13 +220,48 @@ Package management operations.
 | `action` | string | `load`, `list`, or `stats` |
 | `path` | string? | Directory path (for `load`) |
 
+### `al_cli_status`
+
+Check AL CLI availability or attempt auto-installation. The AL CLI is required for loading runtime packages (like the Base Application) that don't embed `SymbolReference.json`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `action` | string | `status` (check availability) or `install` (auto-install via dotnet) |
+
+## AL CLI Integration
+
+Some `.app` packages — particularly the Microsoft Base Application which contains core tables like **Sales Header** (Table 36), **Sales Line**, **Purchase Header**, **G/L Entry**, etc. — are distributed as **runtime packages** that don't include `SymbolReference.json` inside the ZIP archive. These packages require the AL CLI tool to convert them into symbol packages.
+
+The server automatically:
+1. Tries direct ZIP extraction first (fast, no dependencies)
+2. Falls back to `AL CreateSymbolPackage` when direct extraction fails
+3. Logs a helpful message with installation instructions when AL CLI is needed but not found
+
+### Installing the AL CLI
+
+```bash
+# Windows
+dotnet tool install --global Microsoft.Dynamics.BusinessCentral.Development.Tools --prerelease
+
+# Linux
+dotnet tool install --global Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux --prerelease
+
+# macOS
+dotnet tool install --global Microsoft.Dynamics.BusinessCentral.Development.Tools.Osx --prerelease
+```
+
+Or use the `al_cli_status` MCP tool with `action: "install"` to auto-install.
+
+You can also set the `AL_CLI_PATH` environment variable to point to a custom AL binary location.
+
 ## How It Works
 
 1. **Discovery**: Scans for `.alpackages` directories and `.app` files
 2. **Extraction**: Reads `.app` files (ZIP archives with a 40-byte NAVX header), extracts `NavxManifest.xml` and `SymbolReference.json`
-3. **Parsing**: Processes symbol JSON supporting both modern namespaced and legacy flat formats
-4. **Indexing**: Builds an in-memory database with multiple indices for fast lookups
-5. **Serving**: Exposes indexed data through 7 MCP tools over stdio
+3. **AL CLI fallback**: For runtime packages without `SymbolReference.json`, uses `AL CreateSymbolPackage` to generate symbol references
+4. **Parsing**: Processes symbol JSON supporting both modern namespaced and legacy flat formats
+5. **Indexing**: Builds an in-memory database with multiple indices for fast lookups
+6. **Serving**: Exposes indexed data through 8 MCP tools over stdio
 
 ## Supported AL Object Types
 
