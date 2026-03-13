@@ -36,15 +36,25 @@ fn process_symbol_reference(root: &Value, package_name: &str) -> Vec<ALObject> {
     let mut objects = Vec::new();
 
     if let Some(namespaces) = root.get("Namespaces").and_then(|v| v.as_array()) {
-        for ns in namespaces {
-            let ns_name = ns.get("Name").and_then(|v| v.as_str()).map(|s| s.to_string());
-            process_objects_at_level(ns, package_name, &ns_name, &mut objects);
-        }
+        process_namespaces(namespaces, package_name, &mut objects);
     }
 
+    // Legacy format: objects directly at root level (pre-namespace AL)
     process_objects_at_level(root, package_name, &None, &mut objects);
 
     objects
+}
+
+/// Recursively walk the namespace tree so sub-namespaces are never silently lost.
+fn process_namespaces(namespaces: &[Value], package_name: &str, objects: &mut Vec<ALObject>) {
+    for ns in namespaces {
+        let ns_name = ns.get("Name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        process_objects_at_level(ns, package_name, &ns_name, objects);
+
+        if let Some(children) = ns.get("Namespaces").and_then(|v| v.as_array()) {
+            process_namespaces(children, package_name, objects);
+        }
+    }
 }
 
 const OBJECT_TYPE_KEYS: &[&str] = &[
@@ -59,6 +69,7 @@ const OBJECT_TYPE_KEYS: &[&str] = &[
     "Queries",
     "XmlPorts",
     "EnumTypes",
+    "Enums",
     "EnumExtensionTypes",
     "Interfaces",
     "PermissionSets",
@@ -359,6 +370,7 @@ fn parse_data_items(value: &Value) -> Vec<ALDataItem> {
     value
         .get("DataItems")
         .or_else(|| value.get("Dataset"))
+        .or_else(|| value.get("Elements"))
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(parse_single_data_item).collect())
         .unwrap_or_default()
@@ -373,6 +385,8 @@ fn parse_single_data_item(value: &Value) -> Option<ALDataItem> {
     let table_name = value
         .get("TableName")
         .or_else(|| value.get("SourceTableName"))
+        .or_else(|| value.get("RelatedTable"))
+        .or_else(|| value.get("SourceTable"))
         .and_then(|v| v.as_str())
         .map(|s| {
             if let Some(pos) = s.rfind('#') {
@@ -390,6 +404,8 @@ fn parse_single_data_item(value: &Value) -> Option<ALDataItem> {
                     let cname = c.get("Name").and_then(|v| v.as_str())?.to_string();
                     let source_expression = c
                         .get("SourceExpression")
+                        .or_else(|| c.get("SourceExpr"))
+                        .or_else(|| c.get("SourceColumn"))
                         .and_then(|v| v.as_str())
                         .map(String::from);
                     Some(ALColumn {
@@ -402,6 +418,7 @@ fn parse_single_data_item(value: &Value) -> Option<ALDataItem> {
         .unwrap_or_default();
     let children = value
         .get("DataItems")
+        .or_else(|| value.get("Elements"))
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(parse_single_data_item).collect())
         .unwrap_or_default();
@@ -442,6 +459,215 @@ fn parse_variables(value: &Value) -> Vec<ALVariable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_nested_namespaces() {
+        let json = r##"{
+            "RuntimeVersion": "26.0.0.0",
+            "Namespaces": [
+                {
+                    "Name": "Microsoft.Foundation",
+                    "Tables": [
+                        { "Id": 8, "Name": "Language", "Fields": [] }
+                    ],
+                    "Namespaces": [
+                        {
+                            "Name": "Microsoft.Foundation.Address",
+                            "Tables": [
+                                { "Id": 9, "Name": "Country/Region", "Fields": [] }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "Name": "Microsoft.Sales.Document",
+                    "Tables": [
+                        {
+                            "Id": 36,
+                            "Name": "Sales Header",
+                            "Fields": [
+                                { "Id": 1, "Name": "Document Type", "TypeDefinition": { "Name": "Enum" } },
+                                { "Id": 2, "Name": "Sell-to Customer No.", "TypeDefinition": { "Name": "Code", "Length": 20 } },
+                                { "Id": 3, "Name": "No.", "TypeDefinition": { "Name": "Code", "Length": 20 } }
+                            ],
+                            "Keys": [
+                                { "Name": "PK", "FieldNames": ["Document Type", "No."] }
+                            ],
+                            "Methods": [
+                                { "Name": "InitRecord", "Parameters": [] },
+                                { "Name": "AssistEdit", "ReturnTypeDefinition": { "Name": "Boolean" }, "Parameters": [
+                                    { "Name": "OldSalesHeader", "TypeDefinition": { "Name": "Record", "Subtype": { "Name": "Sales Header" } }, "IsVar": false }
+                                ]}
+                            ]
+                        },
+                        {
+                            "Id": 37,
+                            "Name": "Sales Line",
+                            "Fields": [
+                                { "Id": 1, "Name": "Document Type", "TypeDefinition": { "Name": "Enum" } },
+                                { "Id": 3, "Name": "Document No.", "TypeDefinition": { "Name": "Code", "Length": 20 } }
+                            ]
+                        }
+                    ],
+                    "Pages": [
+                        { "Id": 42, "Name": "Sales Order", "Properties": [{ "Name": "SourceTable", "Value": "#appid#Sales Header" }] }
+                    ]
+                },
+                {
+                    "Name": "Microsoft.Sales.Customer",
+                    "Tables": [
+                        { "Id": 18, "Name": "Customer", "Fields": [
+                            { "Id": 1, "Name": "No.", "TypeDefinition": { "Name": "Code", "Length": 20 } }
+                        ]}
+                    ]
+                }
+            ]
+        }"##;
+
+        let objects = parse_symbols_from_json(json.as_bytes(), "Base App v26.0").unwrap();
+
+        // All objects from all namespace levels must be present
+        let names: Vec<&str> = objects.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"Language"), "Missing Language from Microsoft.Foundation");
+        assert!(names.contains(&"Country/Region"), "Missing Country/Region from nested Microsoft.Foundation.Address");
+        assert!(names.contains(&"Sales Header"), "Missing Sales Header from Microsoft.Sales.Document");
+        assert!(names.contains(&"Sales Line"), "Missing Sales Line from Microsoft.Sales.Document");
+        assert!(names.contains(&"Sales Order"), "Missing Sales Order page");
+        assert!(names.contains(&"Customer"), "Missing Customer from Microsoft.Sales.Customer");
+
+        assert_eq!(objects.len(), 6);
+
+        let sales_header = objects.iter().find(|o| o.name == "Sales Header").unwrap();
+        assert_eq!(sales_header.id, 36);
+        assert_eq!(sales_header.object_type, ALObjectType::Table);
+        assert_eq!(sales_header.namespace.as_deref(), Some("Microsoft.Sales.Document"));
+        assert_eq!(sales_header.fields.len(), 3);
+        assert_eq!(sales_header.keys.len(), 1);
+        assert_eq!(sales_header.procedures.len(), 2);
+        assert_eq!(sales_header.procedures[1].parameters.len(), 1);
+
+        let country = objects.iter().find(|o| o.name == "Country/Region").unwrap();
+        assert_eq!(country.namespace.as_deref(), Some("Microsoft.Foundation.Address"));
+    }
+
+    #[test]
+    fn test_parse_enums_key() {
+        let json = r##"{
+            "Enums": [
+                { "Id": 5, "Name": "Sales Document Type",
+                  "Values": [
+                    { "Ordinal": 0, "Name": "Quote" },
+                    { "Ordinal": 1, "Name": "Order" },
+                    { "Ordinal": 2, "Name": "Invoice" },
+                    { "Ordinal": 3, "Name": "Credit Memo" },
+                    { "Ordinal": 4, "Name": "Blanket Order" },
+                    { "Ordinal": 5, "Name": "Return Order" }
+                  ]
+                }
+            ]
+        }"##;
+
+        let objects = parse_symbols_from_json(json.as_bytes(), "Test").unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].name, "Sales Document Type");
+        assert_eq!(objects[0].object_type, ALObjectType::Enum);
+        assert_eq!(objects[0].enum_values.len(), 6);
+        assert_eq!(objects[0].enum_values[1].name, "Order");
+    }
+
+    #[test]
+    fn test_parse_query_elements() {
+        let json = r##"{
+            "Queries": [
+                {
+                    "Id": 105,
+                    "Name": "Customer Sales Quantities",
+                    "Elements": [
+                        {
+                            "Name": "Cust",
+                            "RelatedTable": "#appid#Customer",
+                            "Columns": [
+                                { "Name": "Customer_No", "SourceColumn": "No." },
+                                { "Name": "Customer_Name", "SourceColumn": "Name" }
+                            ],
+                            "Elements": [
+                                {
+                                    "Name": "SalesLine",
+                                    "RelatedTable": "#appid#Sales Line",
+                                    "Columns": [
+                                        { "Name": "Quantity", "SourceColumn": "Quantity" }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"##;
+
+        let objects = parse_symbols_from_json(json.as_bytes(), "Test").unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].name, "Customer Sales Quantities");
+        assert_eq!(objects[0].object_type, ALObjectType::Query);
+        assert_eq!(objects[0].data_items.len(), 1);
+        assert_eq!(objects[0].data_items[0].name, "Cust");
+        assert_eq!(objects[0].data_items[0].table_name.as_deref(), Some("Customer"));
+        assert_eq!(objects[0].data_items[0].columns.len(), 2);
+        assert_eq!(objects[0].data_items[0].columns[0].source_expression.as_deref(), Some("No."));
+        assert_eq!(objects[0].data_items[0].children.len(), 1);
+        assert_eq!(objects[0].data_items[0].children[0].table_name.as_deref(), Some("Sales Line"));
+    }
+
+    #[test]
+    fn test_large_symbol_object_counts() {
+        let make_table = |i: usize| -> serde_json::Value {
+            serde_json::json!({
+                "Id": i, "Name": format!("Table{}", i),
+                "Fields": [{"Id": 1, "Name": "PK", "TypeDefinition": {"Name": "Code"}}],
+                "Methods": [{"Name": "Init", "Parameters": []}]
+            })
+        };
+        let make_page = |i: usize| -> serde_json::Value {
+            serde_json::json!({
+                "Id": i, "Name": format!("Page{}", i),
+                "Properties": [{"Name": "SourceTable", "Value": format!("Table{}", i)}]
+            })
+        };
+        let make_cu = |i: usize| -> serde_json::Value {
+            serde_json::json!({
+                "Id": i, "Name": format!("Codeunit{}", i),
+                "Methods": [{"Name": "Run", "Parameters": []}]
+            })
+        };
+
+        let tables: Vec<_> = (1..=200).map(make_table).collect();
+        let pages: Vec<_> = (1..=150).map(make_page).collect();
+        let codeunits: Vec<_> = (1..=100).map(make_cu).collect();
+
+        let root = serde_json::json!({
+            "Namespaces": [
+                {"Name": "Test.Namespace.One", "Tables": tables, "Pages": pages},
+                {"Name": "Test.Namespace.Two", "Codeunits": codeunits}
+            ]
+        });
+
+        let json = serde_json::to_vec(&root).unwrap();
+        let objects = parse_symbols_from_json(&json, "LargeApp v1.0").unwrap();
+        assert_eq!(objects.len(), 450, "Expected 200 tables + 150 pages + 100 codeunits");
+
+        let table_count = objects.iter().filter(|o| o.object_type == ALObjectType::Table).count();
+        assert_eq!(table_count, 200);
+
+        let page_count = objects.iter().filter(|o| o.object_type == ALObjectType::Page).count();
+        assert_eq!(page_count, 150);
+
+        let cu_count = objects.iter().filter(|o| o.object_type == ALObjectType::Codeunit).count();
+        assert_eq!(cu_count, 100);
+
+        let table1 = objects.iter().find(|o| o.name == "Table1").unwrap();
+        assert_eq!(table1.fields.len(), 1);
+        assert_eq!(table1.procedures.len(), 1);
+    }
 
     #[test]
     fn test_parse_namespaced_symbols() {

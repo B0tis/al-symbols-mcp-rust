@@ -63,7 +63,7 @@ impl ALObjectType {
             "ReportExtensions" => ALObjectType::ReportExtension,
             "Queries" => ALObjectType::Query,
             "XmlPorts" => ALObjectType::XmlPort,
-            "EnumTypes" => ALObjectType::Enum,
+            "EnumTypes" | "Enums" => ALObjectType::Enum,
             "EnumExtensionTypes" => ALObjectType::EnumExtension,
             "Interfaces" => ALObjectType::Interface,
             "PermissionSets" => ALObjectType::PermissionSet,
