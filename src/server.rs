@@ -33,11 +33,19 @@ impl AlMcpServer {
                 .unwrap_or_else(|_| ".".into());
             eprintln!("Auto-discovering packages from {}...", cwd);
 
+            // This triggers the one-time lazy probe of the AL CLI.
             let cli_status = self.package_manager.al_cli_status();
             if cli_status.available {
-                eprintln!("AL CLI: {} ({})", cli_status.path, cli_status.version.as_deref().unwrap_or("unknown"));
+                eprintln!(
+                    "AL CLI: {} ({})",
+                    cli_status.path,
+                    cli_status.version.as_deref().unwrap_or("unknown")
+                );
             } else {
-                eprintln!("AL CLI: not found — runtime packages will be skipped. Use al_cli_status tool to install.");
+                eprintln!(
+                    "AL CLI: not found — runtime packages will be skipped. \
+                     Use al_cli_status tool to install."
+                );
             }
 
             let start = std::time::Instant::now();
@@ -65,8 +73,9 @@ impl AlMcpServer {
         if errors.is_empty() {
             return None;
         }
-        let cli_status = self.package_manager.al_cli_status();
-        let cli_hint = if !cli_status.available {
+        // al_cli_status() uses a cached probe — no subprocess spawned here.
+        let cli_available = self.package_manager.al_cli_status().available;
+        let cli_hint = if !cli_available {
             " Some packages may be runtime-only and require the AL CLI to extract symbols. \
              Use al_cli_status with action 'install' to set up AL CLI, then reload with al_packages action 'load'."
         } else {
@@ -614,7 +623,8 @@ impl AlMcpServer {
     ) -> Result<CallToolResult, McpError> {
         match params.action.as_str() {
             "status" => {
-                let status = self.package_manager.al_cli_status();
+                // Fresh probe so the user gets up-to-date info.
+                let status = self.package_manager.refresh_al_cli_status();
                 Ok(Self::json_result(&serde_json::json!({
                     "available": status.available,
                     "path": status.path,

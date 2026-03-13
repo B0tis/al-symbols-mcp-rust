@@ -19,10 +19,6 @@ pub enum AlCliError {
     InstallFailed(String),
 }
 
-pub struct AlCli {
-    al_command: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct AlCliStatus {
     pub available: bool,
@@ -31,132 +27,105 @@ pub struct AlCliStatus {
     pub message: String,
 }
 
+pub struct AlCli {
+    al_command: String,
+}
+
 impl AlCli {
-    /// Create a new AlCli instance, auto-detecting the AL command path.
-    pub fn new() -> Self {
+    /// Detect the AL CLI. Does NOT spawn any subprocess — just picks the
+    /// command string. Call `probe()` to actually check availability.
+    pub fn detect() -> Self {
         let al_command = std::env::var("AL_CLI_PATH").unwrap_or_else(|_| "AL".into());
         Self { al_command }
     }
 
-    /// Create with an explicit path to the AL binary.
-    pub fn with_path(al_path: impl Into<String>) -> Self {
-        Self {
-            al_command: al_path.into(),
-        }
-    }
-
-    /// Check if the AL CLI is available and return status info.
-    pub fn check_availability(&self) -> AlCliStatus {
-        match self.get_version() {
-            Ok(version) => AlCliStatus {
+    /// Probe whether the AL CLI is actually runnable and return a cached status
+    /// snapshot. This spawns `AL --version` exactly once.
+    pub fn probe(&self) -> AlCliStatus {
+        if let Ok(version) = self.get_version() {
+            return AlCliStatus {
                 available: true,
                 path: self.al_command.clone(),
-                version: Some(version.clone()),
-                message: format!("AL CLI available: {} ({})", self.al_command, version),
-            },
-            Err(_) => {
-                if let Some(found) = self.search_common_paths() {
-                    match Self::with_path(&found).get_version() {
-                        Ok(version) => AlCliStatus {
-                            available: true,
-                            path: found,
-                            version: Some(version.clone()),
-                            message: format!("AL CLI found at alternate path ({})", version),
-                        },
-                        Err(_) => AlCliStatus {
-                            available: false,
-                            path: self.al_command.clone(),
-                            version: None,
-                            message: Self::install_instructions(),
-                        },
-                    }
-                } else {
-                    AlCliStatus {
-                        available: false,
-                        path: self.al_command.clone(),
-                        version: None,
-                        message: Self::install_instructions(),
-                    }
-                }
+                version: Some(version),
+                message: format!("AL CLI available at {}", self.al_command),
+            };
+        }
+
+        if let Some(found) = search_common_paths() {
+            if let Ok(version) = run_version(&found) {
+                return AlCliStatus {
+                    available: true,
+                    path: found,
+                    version: Some(version),
+                    message: "AL CLI found at alternate path".into(),
+                };
             }
         }
+
+        AlCliStatus {
+            available: false,
+            path: self.al_command.clone(),
+            version: None,
+            message: Self::install_instructions(),
+        }
     }
 
-    /// Try to find AL CLI and update internal path. Returns the resolved AlCli if found.
-    pub fn resolve(mut self) -> Self {
-        if self.get_version().is_ok() {
-            return self;
-        }
-        if let Some(found) = self.search_common_paths() {
-            if Self::with_path(&found).get_version().is_ok() {
-                self.al_command = found;
+    fn get_version(&self) -> Result<String, AlCliError> {
+        run_version(&self.al_command)
+    }
+
+    /// Convert a runtime .app package into a symbol package containing
+    /// SymbolReference.json.  Returns the path to the generated file.
+    ///
+    /// If `cache_dir` is `Some`, the result is stored there so future calls
+    /// with the same input skip the conversion entirely.
+    pub fn create_symbol_package(
+        &self,
+        app_path: &Path,
+        cache_dir: Option<&Path>,
+    ) -> Result<PathBuf, AlCliError> {
+        if let Some(dir) = cache_dir {
+            let cached = cached_symbol_path(dir, app_path);
+            if cached.exists() {
+                debug!("AL CLI cache hit: {}", cached.display());
+                return Ok(cached);
             }
         }
-        self
-    }
 
-    /// Check if AL CLI is available (quick test).
-    pub fn is_available(&self) -> bool {
-        self.get_version().is_ok()
-    }
-
-    /// Get the AL CLI version string.
-    pub fn get_version(&self) -> Result<String, AlCliError> {
-        let output = Command::new(&self.al_command)
-            .arg("--version")
-            .output()
-            .map_err(AlCliError::ProcessError)?;
-
-        if output.status.success() || !output.stdout.is_empty() {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if version.is_empty() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                if !stderr.is_empty() {
-                    return Ok(stderr);
-                }
+        let out_path = match cache_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).ok();
+                cached_symbol_path(dir, app_path)
             }
-            Ok(version)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(AlCliError::CommandFailed {
-                code: output.status.code().unwrap_or(-1),
-                stderr,
-            })
-        }
-    }
-
-    /// Convert a runtime .app package into a symbol package that contains SymbolReference.json.
-    /// Returns the path to the created symbol package (temporary file).
-    pub fn create_symbol_package(&self, app_path: &Path) -> Result<PathBuf, AlCliError> {
-        let symbol_path = std::env::temp_dir().join(format!(
-            "al_symbols_{}_{}",
-            std::process::id(),
-            app_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-        )).with_extension("app");
+            None => std::env::temp_dir()
+                .join(format!(
+                    "al_sym_{}_{}",
+                    std::process::id(),
+                    app_path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ))
+                .with_extension("app"),
+        };
 
         debug!(
             "AL CLI: CreateSymbolPackage {} -> {}",
             app_path.display(),
-            symbol_path.display()
+            out_path.display()
         );
 
         let output = Command::new(&self.al_command)
             .arg("CreateSymbolPackage")
             .arg(app_path)
-            .arg(&symbol_path)
+            .arg(&out_path)
             .output()
             .map_err(AlCliError::ProcessError)?;
 
         if output.status.success() {
-            if symbol_path.exists() {
-                info!(
-                    "AL CLI: Created symbol package at {}",
-                    symbol_path.display()
-                );
-                Ok(symbol_path)
+            if out_path.exists() {
+                info!("AL CLI: Created symbol package at {}", out_path.display());
+                Ok(out_path)
             } else {
                 Err(AlCliError::CommandFailed {
                     code: 0,
@@ -175,12 +144,15 @@ impl AlCli {
 
     /// Try to auto-install the AL CLI using `dotnet tool install`.
     pub fn try_auto_install() -> Result<String, AlCliError> {
-        if !Self::is_dotnet_available() {
+        if !is_dotnet_available() {
             return Err(AlCliError::DotnetNotFound);
         }
 
-        let package_name = Self::platform_package_name();
-        info!("Attempting to install AL CLI: dotnet tool install --global {} --prerelease", package_name);
+        let package_name = platform_package_name();
+        info!(
+            "Installing AL CLI: dotnet tool install --global {} --prerelease",
+            package_name
+        );
 
         let output = Command::new("dotnet")
             .args(["tool", "install", "--global", &package_name, "--prerelease"])
@@ -189,7 +161,7 @@ impl AlCli {
 
         if output.status.success() {
             let msg = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            info!("AL CLI installed successfully: {}", msg);
+            info!("AL CLI installed: {}", msg);
             Ok(msg)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -201,55 +173,8 @@ impl AlCli {
         }
     }
 
-    /// Get OS-specific dotnet package name for the AL CLI.
-    fn platform_package_name() -> String {
-        if cfg!(target_os = "windows") {
-            "Microsoft.Dynamics.BusinessCentral.Development.Tools".into()
-        } else if cfg!(target_os = "macos") {
-            "Microsoft.Dynamics.BusinessCentral.Development.Tools.Osx".into()
-        } else {
-            "Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux".into()
-        }
-    }
-
-    fn is_dotnet_available() -> bool {
-        Command::new("dotnet")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    fn search_common_paths(&self) -> Option<String> {
-        let home = dirs_home();
-
-        let candidates: Vec<PathBuf> = if cfg!(target_os = "windows") {
-            vec![
-                home.join(".dotnet").join("tools").join("AL.exe"),
-                PathBuf::from(r"C:\Program Files\dotnet\tools\AL.exe"),
-                PathBuf::from(r"C:\Program Files (x86)\dotnet\tools\AL.exe"),
-            ]
-        } else {
-            vec![
-                home.join(".dotnet").join("tools").join("AL"),
-                PathBuf::from("/usr/local/share/dotnet/tools/AL"),
-                PathBuf::from("/usr/share/dotnet/tools/AL"),
-                PathBuf::from("/opt/dotnet/tools/AL"),
-            ]
-        };
-
-        for candidate in candidates {
-            if candidate.exists() {
-                let path_str = candidate.to_string_lossy().to_string();
-                debug!("Found AL CLI candidate at {}", path_str);
-                return Some(path_str);
-            }
-        }
-        None
-    }
-
     pub fn install_instructions() -> String {
-        let pkg = Self::platform_package_name();
+        let pkg = platform_package_name();
         format!(
             "AL CLI not found. To install:\n\
              1. Install .NET SDK: https://dotnet.microsoft.com/download\n\
@@ -265,7 +190,7 @@ impl AlCli {
         )
     }
 
-    /// Clean up a temporary symbol package file.
+    /// Clean up a temporary (non-cached) symbol package file.
     pub fn cleanup_symbol_file(path: &Path) {
         if path.exists() {
             if let Err(e) = std::fs::remove_file(path) {
@@ -275,9 +200,87 @@ impl AlCli {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Private helpers (no subprocess unless explicitly called)
+// ---------------------------------------------------------------------------
+
+fn run_version(al_command: &str) -> Result<String, AlCliError> {
+    let output = Command::new(al_command)
+        .arg("--version")
+        .output()
+        .map_err(AlCliError::ProcessError)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() || !stdout.is_empty() {
+        Ok(if stdout.is_empty() { stderr } else { stdout })
+    } else {
+        Err(AlCliError::CommandFailed {
+            code: output.status.code().unwrap_or(-1),
+            stderr,
+        })
+    }
+}
+
+fn search_common_paths() -> Option<String> {
+    let home = dirs_home();
+
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "windows") {
+        vec![
+            home.join(".dotnet").join("tools").join("AL.exe"),
+            PathBuf::from(r"C:\Program Files\dotnet\tools\AL.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\dotnet\tools\AL.exe"),
+        ]
+    } else {
+        vec![
+            home.join(".dotnet").join("tools").join("AL"),
+            PathBuf::from("/usr/local/share/dotnet/tools/AL"),
+            PathBuf::from("/usr/share/dotnet/tools/AL"),
+            PathBuf::from("/opt/dotnet/tools/AL"),
+        ]
+    };
+
+    for c in candidates {
+        if c.exists() {
+            debug!("Found AL CLI candidate: {}", c.display());
+            return Some(c.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn is_dotnet_available() -> bool {
+    Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn platform_package_name() -> String {
+    if cfg!(target_os = "windows") {
+        "Microsoft.Dynamics.BusinessCentral.Development.Tools".into()
+    } else if cfg!(target_os = "macos") {
+        "Microsoft.Dynamics.BusinessCentral.Development.Tools.Osx".into()
+    } else {
+        "Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux".into()
+    }
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Deterministic cache path: `<cache_dir>/<stem>.symbols.app`
+fn cached_symbol_path(cache_dir: &Path, app_path: &Path) -> PathBuf {
+    let stem = app_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    cache_dir.join(format!("{}.symbols.app", stem))
 }

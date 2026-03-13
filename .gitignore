@@ -21,6 +21,9 @@ target
 #.idea/
 
 
+# AL CLI symbol cache
+.alcache/
+
 # Added by cargo
 
 /target

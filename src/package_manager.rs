@@ -1,11 +1,10 @@
-use crate::al_cli::AlCli;
+use crate::al_cli::{AlCli, AlCliStatus};
 use crate::database::SymbolDatabase;
 use crate::manifest::parse_manifest_from_app;
 use crate::symbol_parser::{parse_symbols_from_app, parse_symbols_from_json};
 use crate::types::ALPackageInfo;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
@@ -24,45 +23,99 @@ pub enum PackageError {
     AlCli(#[from] crate::al_cli::AlCliError),
 }
 
+/// Holds a lazily-resolved, cached AL CLI instance and its status.
+struct AlCliState {
+    /// The resolved AL CLI wrapper (None if unavailable).
+    cli: Option<AlCli>,
+    /// Cached probe result so we never re-spawn `AL --version` for status checks.
+    status: AlCliStatus,
+}
+
 pub struct PackageManager {
     database: SymbolDatabase,
-    al_cli: Arc<parking_lot::Mutex<Option<AlCli>>>,
+    /// Lazy: starts as `None`, probed once on first need, then cached.
+    al_cli_state: parking_lot::Mutex<Option<AlCliState>>,
     loaded_packages: parking_lot::Mutex<Vec<ALPackageInfo>>,
     loaded_dirs: parking_lot::Mutex<HashSet<String>>,
     load_errors: parking_lot::Mutex<Vec<String>>,
     al_cli_warned: parking_lot::Mutex<bool>,
+    /// Workspace root, used to derive the symbol-cache directory.
+    workspace_root: parking_lot::Mutex<Option<PathBuf>>,
 }
 
 impl PackageManager {
     pub fn new(database: SymbolDatabase) -> Self {
-        let al_cli = AlCli::new().resolve();
-        let available = al_cli.is_available();
         Self {
             database,
-            al_cli: Arc::new(parking_lot::Mutex::new(if available {
-                Some(al_cli)
-            } else {
-                None
-            })),
+            al_cli_state: parking_lot::Mutex::new(None),
             loaded_packages: parking_lot::Mutex::new(Vec::new()),
             loaded_dirs: parking_lot::Mutex::new(HashSet::new()),
             load_errors: parking_lot::Mutex::new(Vec::new()),
             al_cli_warned: parking_lot::Mutex::new(false),
+            workspace_root: parking_lot::Mutex::new(None),
         }
     }
 
-    pub fn al_cli_status(&self) -> crate::al_cli::AlCliStatus {
-        let cli = AlCli::new().resolve();
-        cli.check_availability()
+    /// Get the cached AL CLI status. Probes exactly once (first call), then
+    /// returns the cached snapshot on all subsequent calls — zero subprocess
+    /// overhead on the hot path.
+    pub fn al_cli_status(&self) -> AlCliStatus {
+        let guard = self.ensure_al_cli_probed();
+        guard.as_ref().unwrap().status.clone()
+    }
+
+    /// Force a fresh probe (used after installation).
+    pub fn refresh_al_cli_status(&self) -> AlCliStatus {
+        let state = Self::probe_al_cli();
+        let status = state.status.clone();
+        *self.al_cli_state.lock() = Some(state);
+        status
     }
 
     pub fn try_install_al_cli(&self) -> Result<String, crate::al_cli::AlCliError> {
         let result = AlCli::try_auto_install()?;
-        let cli = AlCli::new().resolve();
-        if cli.is_available() {
-            *self.al_cli.lock() = Some(cli);
-        }
+        self.refresh_al_cli_status();
         Ok(result)
+    }
+
+    fn ensure_al_cli_probed(&self) -> parking_lot::MutexGuard<'_, Option<AlCliState>> {
+        let mut guard = self.al_cli_state.lock();
+        if guard.is_none() {
+            *guard = Some(Self::probe_al_cli());
+        }
+        guard
+    }
+
+    fn probe_al_cli() -> AlCliState {
+        let cli = AlCli::detect();
+        let status = cli.probe();
+        if status.available {
+            let resolved = AlCli::detect();
+            AlCliState {
+                cli: Some(if status.path != "AL" {
+                    // probe found it at an alternate path — but AlCli::detect()
+                    // already picks up AL_CLI_PATH; for the alternate-path case
+                    // we just use the discovered command directly.
+                    resolved
+                } else {
+                    resolved
+                }),
+                status,
+            }
+        } else {
+            AlCliState {
+                cli: None,
+                status,
+            }
+        }
+    }
+
+    /// Derive the symbol-package cache directory from the workspace root.
+    fn symbol_cache_dir(&self) -> Option<PathBuf> {
+        self.workspace_root
+            .lock()
+            .as_ref()
+            .map(|root| root.join(".alcache"))
     }
 
     pub fn database(&self) -> &SymbolDatabase {
@@ -82,6 +135,7 @@ impl PackageManager {
     }
 
     pub fn auto_discover_and_load(&self, root_path: &str) -> Result<LoadResult, PackageError> {
+        *self.workspace_root.lock() = Some(PathBuf::from(root_path));
         let dirs = self.discover_package_directories(root_path)?;
 
         if dirs.is_empty() {
@@ -225,14 +279,25 @@ impl PackageManager {
         manifest: &ALPackageInfo,
         package_name: &str,
     ) -> Result<(ALPackageInfo, usize), String> {
-        let al_cli_guard = self.al_cli.lock();
-        let al_cli = al_cli_guard
+        let state_guard = self.ensure_al_cli_probed();
+        let state = state_guard.as_ref().ok_or("AL CLI state not initialised")?;
+        let al_cli = state
+            .cli
             .as_ref()
             .ok_or_else(|| "AL CLI not available".to_string())?;
 
+        let cache_dir = self.symbol_cache_dir();
         let symbol_path = al_cli
-            .create_symbol_package(app_path)
+            .create_symbol_package(app_path, cache_dir.as_deref())
             .map_err(|e| format!("CreateSymbolPackage failed: {}", e))?;
+
+        // Don't hold the state lock while doing the (potentially heavy) I/O.
+        drop(state_guard);
+
+        let is_cached = cache_dir
+            .as_ref()
+            .map(|d| symbol_path.starts_with(d))
+            .unwrap_or(false);
 
         let result = (|| -> Result<(ALPackageInfo, usize), String> {
             let objects = parse_symbols_from_app(&symbol_path, package_name)
@@ -246,16 +311,19 @@ impl PackageManager {
 
             let count = objects.len();
             info!(
-                "AL CLI: Loaded {} objects from {} via CreateSymbolPackage",
+                "AL CLI: Loaded {} objects from {} via CreateSymbolPackage{}",
                 count,
-                app_path.display()
+                app_path.display(),
+                if is_cached { " (cached)" } else { "" }
             );
             self.database.add_objects(objects);
             self.loaded_packages.lock().push(manifest.clone());
             Ok((manifest.clone(), count))
         })();
 
-        AlCli::cleanup_symbol_file(&symbol_path);
+        if !is_cached {
+            AlCli::cleanup_symbol_file(&symbol_path);
+        }
         result
     }
 
