@@ -113,6 +113,9 @@ struct SearchObjectsParams {
     /// Filter by object type (Table, Page, Codeunit, Report, Enum, etc.)
     #[serde(default)]
     object_type: Option<String>,
+    /// Filter by namespace (wildcards supported: * and ?). E.g. "Microsoft.Sales.*"
+    #[serde(default)]
+    namespace: Option<String>,
     /// Maximum results to return (default: 50)
     #[serde(default = "default_limit")]
     limit: usize,
@@ -238,7 +241,7 @@ fn default_limit() -> usize {
 impl AlMcpServer {
     #[tool(
         name = "al_search_objects",
-        description = "Search AL objects in YOUR WORKSPACE (.app packages). Analyzes compiled AL code structure. Use summaryMode:true & limit for token efficiency. Supports wildcard patterns (* and ?)."
+        description = "Search AL objects in YOUR WORKSPACE (.app packages). Analyzes compiled AL code structure. Use summaryMode:true & limit for token efficiency. Supports wildcard patterns (* and ?) for pattern, object_type, and namespace filters. Filter by namespace to find all objects in a given namespace (e.g. namespace:'Microsoft.Sales.*')."
     )]
     fn search_objects(
         &self,
@@ -249,6 +252,7 @@ impl AlMcpServer {
         let (results, total) = self.db().search_objects(
             params.pattern.as_deref(),
             params.object_type.as_deref(),
+            params.namespace.as_deref(),
             params.limit,
             params.offset,
         );
@@ -318,6 +322,7 @@ impl AlMcpServer {
                             "name": e.name,
                             "type": e.object_type.to_string(),
                             "id": e.id,
+                            "namespace": e.namespace,
                             "package": e.package_name,
                         })
                     }).collect::<Vec<_>>(),
@@ -366,6 +371,7 @@ impl AlMcpServer {
                 "name": e.name,
                 "type": e.object_type.to_string(),
                 "id": e.id,
+                "namespace": e.namespace,
                 "package": e.package_name,
             })
         }).collect::<Vec<serde_json::Value>>());
@@ -710,9 +716,12 @@ impl AlMcpServer {
             "stats" => {
                 self.ensure_loaded();
                 let stats = self.db().package_stats();
+                let namespaces = self.db().list_namespaces();
                 Ok(Self::json_result(&serde_json::json!({
                     "totalPackages": stats.len(),
                     "totalObjects": self.db().object_count(),
+                    "totalNamespaces": namespaces.len(),
+                    "namespaces": namespaces,
                     "packages": stats,
                 })))
             }

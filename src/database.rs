@@ -232,6 +232,7 @@ impl SymbolDatabase {
         &self,
         pattern: Option<&str>,
         object_type: Option<&str>,
+        namespace: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> (Vec<ALObject>, usize) {
@@ -239,6 +240,24 @@ impl SymbolDatabase {
         let mut results: Vec<&ALObject> = Vec::new();
 
         let type_filter = object_type.map(|t| ALObjectType::from_str_loose(t));
+        let ns_lower = namespace.map(|n| n.to_lowercase());
+
+        let namespace_matches = |obj: &ALObject| -> bool {
+            match &ns_lower {
+                None => true,
+                Some(ns_pat) => {
+                    let obj_ns = obj.namespace.as_deref().unwrap_or("").to_lowercase();
+                    if ns_pat.contains('*') || ns_pat.contains('?') {
+                        let regex_pat = ns_pat.replace('*', ".*").replace('?', ".");
+                        regex::Regex::new(&format!("^{}$", regex_pat))
+                            .map(|re| re.is_match(&obj_ns))
+                            .unwrap_or(false)
+                    } else {
+                        obj_ns.contains(ns_pat.as_str())
+                    }
+                }
+            }
+        };
 
         if let Some(pat) = pattern {
             let pat_lower = pat.to_lowercase();
@@ -253,6 +272,9 @@ impl SymbolDatabase {
                             continue;
                         }
                     }
+                    if !namespace_matches(obj) {
+                        continue;
+                    }
                     if let Some(ref re) = re {
                         if re.is_match(&obj.name.to_lowercase()) {
                             results.push(obj);
@@ -266,6 +288,9 @@ impl SymbolDatabase {
                             continue;
                         }
                     }
+                    if !namespace_matches(obj) {
+                        continue;
+                    }
                     if obj.name.to_lowercase().contains(&pat_lower) {
                         results.push(obj);
                     }
@@ -275,11 +300,18 @@ impl SymbolDatabase {
             let type_str = tf.to_string();
             if let Some(indices) = db.objects_by_type.get(&type_str) {
                 for &idx in indices {
-                    results.push(&db.all_objects[idx]);
+                    let obj = &db.all_objects[idx];
+                    if namespace_matches(obj) {
+                        results.push(obj);
+                    }
                 }
             }
         } else {
-            results = db.all_objects.iter().collect();
+            for obj in &db.all_objects {
+                if namespace_matches(obj) {
+                    results.push(obj);
+                }
+            }
         }
 
         let total = results.len();
@@ -290,6 +322,18 @@ impl SymbolDatabase {
             .cloned()
             .collect();
         (page, total)
+    }
+
+    /// Return all unique namespaces present in the database, sorted alphabetically.
+    pub fn list_namespaces(&self) -> Vec<String> {
+        let db = self.inner.read();
+        let mut namespaces: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for obj in &db.all_objects {
+            if let Some(ref ns) = obj.namespace {
+                namespaces.insert(ns.clone());
+            }
+        }
+        namespaces.into_iter().collect()
     }
 
     pub fn get_object_by_type_id(&self, obj_type: &str, id: i64) -> Option<ALObject> {
@@ -426,6 +470,7 @@ impl SymbolDatabase {
                         results.push(serde_json::json!({
                             "objectName": obj.name,
                             "objectType": obj.object_type.to_string(),
+                            "namespace": obj.namespace,
                             "memberType": "Procedure",
                             "memberName": proc.name,
                             "parameters": proc.parameters.iter().map(|p| {
@@ -447,6 +492,7 @@ impl SymbolDatabase {
                         results.push(serde_json::json!({
                             "objectName": obj.name,
                             "objectType": obj.object_type.to_string(),
+                            "namespace": obj.namespace,
                             "memberType": "Field",
                             "memberName": field.name,
                             "fieldId": field.id,
@@ -591,6 +637,7 @@ fn collect_controls(
             results.push(serde_json::json!({
                 "objectName": obj.name,
                 "objectType": obj.object_type.to_string(),
+                "namespace": obj.namespace,
                 "memberType": "Control",
                 "memberName": ctrl.name,
                 "controlKind": ctrl.kind,
@@ -616,6 +663,7 @@ fn collect_data_items(
             results.push(serde_json::json!({
                 "objectName": obj.name,
                 "objectType": obj.object_type.to_string(),
+                "namespace": obj.namespace,
                 "memberType": "DataItem",
                 "memberName": item.name,
                 "tableName": item.table_name,
@@ -659,15 +707,15 @@ mod tests {
             make_test_object(21, "Customer Card", ALObjectType::Page),
         ]);
 
-        let (results, total) = db.search_objects(Some("customer"), None, 50, 0);
+        let (results, total) = db.search_objects(Some("customer"), None, None, 50, 0);
         assert_eq!(total, 2);
         assert_eq!(results.len(), 2);
 
-        let (results, total) = db.search_objects(None, Some("Table"), 50, 0);
+        let (results, total) = db.search_objects(None, Some("Table"), None, 50, 0);
         assert_eq!(total, 2);
         assert_eq!(results.len(), 2);
 
-        let (results, total) = db.search_objects(Some("cust*"), Some("Table"), 50, 0);
+        let (results, total) = db.search_objects(Some("cust*"), Some("Table"), None, 50, 0);
         assert_eq!(total, 1);
         assert_eq!(results[0].name, "Customer");
     }
@@ -729,12 +777,73 @@ mod tests {
             .collect();
         db.add_objects(objects);
 
-        let (results, total) = db.search_objects(None, None, 3, 0);
+        let (results, total) = db.search_objects(None, None, None, 3, 0);
         assert_eq!(total, 10);
         assert_eq!(results.len(), 3);
 
-        let (results, _) = db.search_objects(None, None, 3, 8);
+        let (results, _) = db.search_objects(None, None, None, 3, 8);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_namespace_filter() {
+        let db = SymbolDatabase::new();
+        let mut obj1 = make_test_object(18, "Customer", ALObjectType::Table);
+        obj1.namespace = Some("Microsoft.Sales.Customer".into());
+        let mut obj2 = make_test_object(36, "Sales Header", ALObjectType::Table);
+        obj2.namespace = Some("Microsoft.Sales.Document".into());
+        let mut obj3 = make_test_object(81, "Gen. Journal Line", ALObjectType::Table);
+        obj3.namespace = Some("Microsoft.Finance.GeneralLedger.Journal".into());
+        let obj4 = make_test_object(1, "Legacy Table", ALObjectType::Table);
+
+        db.add_objects(vec![obj1, obj2, obj3, obj4]);
+
+        // Filter by exact namespace
+        let (results, total) = db.search_objects(None, None, Some("Microsoft.Sales.Customer"), 50, 0);
+        assert_eq!(total, 1);
+        assert_eq!(results[0].name, "Customer");
+
+        // Filter by namespace with wildcard
+        let (_results, total) = db.search_objects(None, None, Some("Microsoft.Sales.*"), 50, 0);
+        assert_eq!(total, 2);
+
+        // Filter by namespace prefix (substring)
+        let (results, total) = db.search_objects(None, None, Some("Microsoft.Finance"), 50, 0);
+        assert_eq!(total, 1);
+        assert_eq!(results[0].name, "Gen. Journal Line");
+
+        // No namespace filter → all objects
+        let (results, total) = db.search_objects(None, None, None, 50, 0);
+        assert_eq!(total, 4);
+        assert_eq!(results.len(), 4);
+
+        // Namespace + type filter combined
+        let (_results, total) = db.search_objects(None, Some("Table"), Some("Microsoft.Sales.*"), 50, 0);
+        assert_eq!(total, 2);
+
+        // Namespace + name pattern combined
+        let (results, total) = db.search_objects(Some("Sales*"), None, Some("Microsoft.Sales.*"), 50, 0);
+        assert_eq!(total, 1);
+        assert_eq!(results[0].name, "Sales Header");
+    }
+
+    #[test]
+    fn test_list_namespaces() {
+        let db = SymbolDatabase::new();
+        let mut obj1 = make_test_object(18, "Customer", ALObjectType::Table);
+        obj1.namespace = Some("Microsoft.Sales.Customer".into());
+        let mut obj2 = make_test_object(36, "Sales Header", ALObjectType::Table);
+        obj2.namespace = Some("Microsoft.Sales.Document".into());
+        let obj3 = make_test_object(1, "Legacy", ALObjectType::Table);
+
+        db.add_objects(vec![obj1, obj2, obj3]);
+
+        let namespaces = db.list_namespaces();
+        assert_eq!(namespaces.len(), 2);
+        assert!(namespaces.contains(&"Microsoft.Sales.Customer".to_string()));
+        assert!(namespaces.contains(&"Microsoft.Sales.Document".to_string()));
+        // sorted alphabetically
+        assert!(namespaces[0] < namespaces[1]);
     }
 
     #[test]
