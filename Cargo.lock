@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "al-symbols-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glob",
  "parking_lot",

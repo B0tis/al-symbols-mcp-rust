@@ -1,6 +1,6 @@
 [package]
 name = "al-symbols-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "High-performance MCP Server for AL (Business Central) dependency analysis"
 license = "MIT"
