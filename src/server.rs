@@ -195,9 +195,6 @@ struct GetFreeIdParams {
     /// How many free IDs to return per type (default: 1)
     #[serde(default = "default_count")]
     count: usize,
-    /// Path to app.json. Auto-detected from the workspace root — only needed if auto-detection fails.
-    #[serde(default)]
-    app_json_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -531,10 +528,7 @@ impl AlMcpServer {
         &self,
         #[tool(aggr)] params: GetFreeIdParams,
     ) -> Result<CallToolResult, McpError> {
-        let app_json_path = match params.app_json_path {
-            Some(ref p) => PathBuf::from(p),
-            None => find_app_json()?,
-        };
+        let app_json_path = find_app_json()?;
 
         let app_dir = app_json_path
             .parent()
@@ -797,7 +791,7 @@ fn find_app_json() -> Result<PathBuf, McpError> {
 
     Err(McpError::internal_error(
         format!(
-            "No app.json found under {}. Provide the path explicitly via the app_json_path parameter.",
+            "No app.json found under {}. Ensure the MCP server is started from your AL project root.",
             cwd.display()
         ),
         None,
